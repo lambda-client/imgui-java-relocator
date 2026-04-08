@@ -1,0 +1,13 @@
+work/
+zig-out/
+zig-cache/
+.zig-cache/
+*.o
+*.so
+*.dll
+*.dylib
+hs_err_*.log
+core.*
+.secrets
+.actrc
+.idea/

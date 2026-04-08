@@ -1,0 +1,333 @@
+name: Build & Publish
+
+on:
+  # Trigger manually or on upstream tag detection via schedule
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream imgui-java tag to build (e.g. v1.90.0)'
+        required: false
+        type: string
+
+  # Poll upstream for new tags daily
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: '0.15.2'
+  JAVA_VERSION: '21'
+
+jobs:
+  # ─── Check for new upstream release ─────────────────────────────────────────
+  check-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load config
+        id: config
+        run: |
+          source config.env
+          echo "upstream_repo=$UPSTREAM_REPO" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve tag
+        id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          CONFIG_TAG: ${{ steps.config.outputs.upstream_tag }}
+          UPSTREAM_REPO: ${{ steps.config.outputs.upstream_repo }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            # Fetch latest release tag from upstream
+            TAG=$(git ls-remote --tags --sort=-v:refname "$UPSTREAM_REPO" 'v*' \
+              | head -1 | sed 's/.*refs\/tags\///' | sed 's/\^{}//')
+            echo "Latest upstream tag: $TAG"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          # Check if we already built this tag
+          if gh release view "$TAG" --json tagName >/dev/null 2>&1; then
+            echo "Release $TAG already exists, skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ─── Relocate + generate JNI sources ────────────────────────────────────────
+  relocate:
+    needs: check-release
+    if: needs.check-release.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Override upstream tag
+        run: |
+          TAG="${{ needs.check-release.outputs.tag }}"
+          sed -i "s/^UPSTREAM_TAG=.*/UPSTREAM_TAG=\"$TAG\"/" config.env
+
+      - name: Run relocate
+        run: ./scripts/relocate.sh
+
+      - name: Run verify
+        run: ./scripts/verify.sh
+
+      - name: Upload work directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: relocated-sources
+          retention-days: 1
+          path: |
+            work/imgui-java/
+            !work/imgui-java/.git/
+
+  # ─── Cross-compile natives ──────────────────────────────────────────────────
+  build-natives:
+    needs: [check-release, relocate]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-gnu
+            artifact: linux-x86_64
+          - target: x86_64-windows-gnu
+            artifact: windows-x86_64
+          - target: x86_64-macos
+            artifact: macos-x86_64
+          - target: aarch64-macos
+            artifact: macos-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Download relocated sources
+        uses: actions/download-artifact@v4
+        with:
+          name: relocated-sources
+          path: work/imgui-java/
+
+      - name: Load config
+        id: config
+        run: |
+          source config.env
+          echo "lib_name=$LIB_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Build native (${{ matrix.target }})
+        run: |
+          zig build \
+            --release=fast \
+            -Dtarget=${{ matrix.target }} \
+            -Dlib-name=${{ steps.config.outputs.lib_name }} \
+            -Djni-dir=work/imgui-java/imgui-binding/build/jni
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.artifact }}
+          retention-days: 1
+          path: |
+            zig-out/lib/*
+            zig-out/bin/*.dll
+
+  # ─── Package JARs + publish to Maven ────────────────────────────────────────
+  publish:
+    needs: [check-release, relocate, build-natives]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Download relocated sources
+        uses: actions/download-artifact@v4
+        with:
+          name: relocated-sources
+          path: work/imgui-java/
+
+      # Download all native artifacts and flatten into bin/
+      - name: Download natives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: work/imgui-java/natives-tmp/
+
+      - name: Flatten natives into bin/
+        run: |
+          mkdir -p work/imgui-java/bin
+          find work/imgui-java/natives-tmp -type f \( -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -exec cp {} work/imgui-java/bin/ \;
+          rm -rf work/imgui-java/natives-tmp
+          ls -la work/imgui-java/bin/
+
+      - name: Load config
+        id: config
+        run: |
+          source config.env
+          echo "lib_name=$LIB_NAME" >> "$GITHUB_OUTPUT"
+          echo "artifact_prefix=$ARTIFACT_PREFIX" >> "$GITHUB_OUTPUT"
+          echo "maven_group=$MAVEN_GROUP" >> "$GITHUB_OUTPUT"
+
+      - name: Verify native libs present
+        run: |
+          LIB_NAME="${{ steps.config.outputs.lib_name }}"
+          for f in "lib${LIB_NAME}.so" "${LIB_NAME}.dll" "lib${LIB_NAME}.dylib"; do
+            if [ ! -f "work/imgui-java/bin/$f" ]; then
+              echo "ERROR: Missing $f"
+              exit 1
+            fi
+            echo "OK: $f ($(stat --printf='%s' "work/imgui-java/bin/$f") bytes)"
+          done
+
+      # Report glibc version requirements (informational, not blocking)
+      - name: Check glibc versions
+        run: |
+          LIB_NAME="${{ steps.config.outputs.lib_name }}"
+          echo "glibc version requirements:"
+          objdump -T "work/imgui-java/bin/lib${LIB_NAME}.so" \
+            | grep -oP 'GLIBC_\d+\.\d+(\.\d+)?' | sort -V | uniq -c | sort -rn
+
+      # Restore execute permission lost during artifact upload/download
+      - name: Fix gradlew permissions
+        run: chmod +x work/imgui-java/gradlew
+
+      - name: Verify Maven credentials
+        env:
+          MAVEN_URL: ${{ secrets.MAVEN_URL }}
+          MAVEN_USER: ${{ secrets.MAVEN_USER }}
+          MAVEN_TOKEN: ${{ secrets.MAVEN_TOKEN }}
+        run: |
+          if [ -z "$MAVEN_URL" ]; then echo "ERROR: MAVEN_URL secret not set"; exit 1; fi
+          if [ -z "$MAVEN_USER" ]; then echo "ERROR: MAVEN_USER secret not set"; exit 1; fi
+          if [ -z "$MAVEN_TOKEN" ]; then echo "ERROR: MAVEN_TOKEN secret not set"; exit 1; fi
+          echo "All Maven secrets are set"
+
+      # Build all JARs
+      - name: Build JARs
+        working-directory: work/imgui-java
+        run: ./gradlew build -x test -x :example:compileJava
+
+      # Run unit tests
+      - name: Run tests
+        working-directory: work/imgui-java
+        run: ./gradlew imgui-binding:test
+
+      # Publish binding, lwjgl3, app JARs
+      - name: Publish to Maven
+        working-directory: work/imgui-java
+        env:
+          MAVEN_URL: ${{ secrets.MAVEN_URL }}
+          MAVEN_USER: ${{ secrets.MAVEN_USER }}
+          MAVEN_TOKEN: ${{ secrets.MAVEN_TOKEN }}
+        run: |
+          for module in imgui-binding imgui-lwjgl3 imgui-app; do
+            echo "Publishing $module..."
+            ./gradlew :$module:publishImguiPublicationToCustomRepository
+          done
+
+      # Publish per-platform natives JARs
+      - name: Publish native JARs
+        working-directory: work/imgui-java
+        env:
+          MAVEN_URL: ${{ secrets.MAVEN_URL }}
+          MAVEN_USER: ${{ secrets.MAVEN_USER }}
+          MAVEN_TOKEN: ${{ secrets.MAVEN_TOKEN }}
+        run: |
+          for platform in linux windows macos; do
+            echo "Publishing natives for $platform..."
+            ./gradlew :imgui-binding-natives:publishImguiPublicationToCustomRepository \
+              -PdeployType=$platform
+          done
+
+  # ─── Create GitHub release ──────────────────────────────────────────────────
+  github-release:
+    needs: [check-release, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load config
+        id: config
+        run: |
+          source config.env
+          echo "lib_name=$LIB_NAME" >> "$GITHUB_OUTPUT"
+          echo "target_pkg=$TARGET_PKG" >> "$GITHUB_OUTPUT"
+          echo "artifact_prefix=$ARTIFACT_PREFIX" >> "$GITHUB_OUTPUT"
+
+      # Collect native binaries for the release
+      - name: Download all natives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: natives-tmp/
+
+      - name: Flatten natives
+        run: |
+          mkdir -p natives
+          find natives-tmp -type f \( -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
+            -exec cp {} natives/ \;
+          rm -rf natives-tmp
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.check-release.outputs.tag }}
+          PKG: ${{ steps.config.outputs.target_pkg }}
+          PREFIX: ${{ steps.config.outputs.artifact_prefix }}
+        run: |
+          VERSION="${TAG#v}"
+          gh release create "$TAG" \
+            --title "$PREFIX $VERSION" \
+            --notes "$(cat <<EOF
+          Relocated build of [imgui-java $TAG](https://github.com/SpaiR/imgui-java/releases/tag/$TAG).
+
+          **Package:** \`$PKG\`
+
+          ### Maven coordinates
+          \`\`\`xml
+          <dependency>
+              <groupId>com.delta</groupId>
+              <artifactId>${PREFIX}-binding</artifactId>
+              <version>${VERSION}</version>
+          </dependency>
+          \`\`\`
+
+          ### Native libraries
+          | Platform | File |
+          |----------|------|
+          | Linux x86_64 | \`lib${{ steps.config.outputs.lib_name }}.so\` |
+          | Windows x86_64 | \`${{ steps.config.outputs.lib_name }}.dll\` |
+          | macOS x86_64 | \`lib${{ steps.config.outputs.lib_name }}.dylib\` |
+          | macOS aarch64 | \`lib${{ steps.config.outputs.lib_name }}.dylib\` |
+          EOF
+          )" \
+            natives/*
